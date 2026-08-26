@@ -1,5 +1,7 @@
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { useInView } from "@/lib/useInView";
+import { buildLeadPayload, submitLead } from "@/lib/leads";
+import { getTelegramUser } from "@/lib/telegram";
 import { cn } from "@/utils/cn";
 import { FocusBrackets, HudLabel } from "./Hud";
 
@@ -10,6 +12,17 @@ export function LeadForm() {
   const [value, setValue] = useState("");
   const [status, setStatus] = useState<Status>("idle");
   const [focused, setFocused] = useState(false);
+  const [prefilled, setPrefilled] = useState(false);
+  const [errorText, setErrorText] = useState("⚠ введите корректный telegram — например @skinvault");
+
+  // Inside Telegram: prefill the form with the user's handle from the Mini App.
+  useEffect(() => {
+    const user = getTelegramUser();
+    if (user?.username) {
+      setValue(`@${user.username}`);
+      setPrefilled(true);
+    }
+  }, []);
 
   const slot = useMemo(() => 63 + Math.floor(Math.random() * 5), []);
   const vaultId = useMemo(
@@ -17,15 +30,22 @@ export function LeadForm() {
     [slot],
   );
 
-  const onSubmit = (e: FormEvent) => {
+  const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     const clean = value.trim().replace(/^@/, "");
     if (clean.length < 4 || /\s/.test(clean)) {
+      setErrorText("⚠ введите корректный telegram — например @skinvault");
       setStatus("error");
       return;
     }
     setStatus("loading");
-    window.setTimeout(() => setStatus("done"), 1400);
+    try {
+      await submitLead(buildLeadPayload(clean, vaultId, slot.toString()));
+      setStatus("done");
+    } catch {
+      setErrorText("⚠ не удалось отправить заявку — попробуйте ещё раз");
+      setStatus("error");
+    }
   };
 
   return (
@@ -133,7 +153,11 @@ export function LeadForm() {
                   <div className="mt-4 flex min-h-[18px] items-center gap-2" aria-live="polite">
                     {status === "error" ? (
                       <span className="font-mono text-[10px] tracking-[0.16em] text-blood-soft uppercase">
-                        ⚠ введите корректный telegram — например @skinvault
+                        {errorText}
+                      </span>
+                    ) : prefilled ? (
+                      <span className="font-mono text-[10px] tracking-[0.16em] text-electric uppercase">
+                        ✓ telegram подтянут из mini app — можно изменить
                       </span>
                     ) : (
                       <span className="font-mono text-[10px] tracking-[0.16em] text-ash/70">
