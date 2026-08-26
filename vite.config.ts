@@ -16,4 +16,14 @@ export default defineConfig({
       "@": path.resolve(__dirname, "src"),
     },
   },
+  server: {
+    host: true,
+    // Allow the sandbox preview host (and any other) to reach the dev server.
+    allowedHosts: true,
+    // In dev, proxy /api to the deployed site (set VITE_API_BASE) so the
+    // form can be tested against the real Pages Function.
+    proxy: process.env.VITE_API_BASE
+      ? { "/api": { target: process.env.VITE_API_BASE, changeOrigin: true } }
+      : undefined,
+  },
 });
