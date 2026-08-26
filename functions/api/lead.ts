@@ -1,19 +1,24 @@
 /**
  * Cloudflare Pages Function: POST /api/lead
  *
- * Receives a lead from the SKINVAULT landing form, then appends a row to a
- * Google Spreadsheet via the Google Sheets API (service-account JWT auth).
+ * Receives a lead from the SKINVAULT landing form and writes it to a Google
+ * Spreadsheet. Two modes (no bot token is ever needed):
  *
- * Env vars (set in Pages project → Settings → Environment variables):
- *   GOOGLE_SERVICE_ACCOUNT_JSON — the full service-account key JSON (paste the
- *                                 whole downloaded file as one string)
- *   GOOGLE_SHEET_ID              — spreadsheet id from the sheet URL
- *   GOOGLE_SHEET_RANGE           — optional, default "Лист1!A1"
+ *  A) Apps Script webhook — RECOMMENDED (no Google Cloud / service account):
+ *     GOOGLE_SHEET_WEBHOOK_URL — deployed Apps Script "/exec" URL (see google/appsscript.gs)
+ *     LEADS_SECRET              — shared secret, must match SCRIPT_SECRET in the script
  *
- * No bot token is needed here: Google auth is done with the service account.
+ *  B) Direct Google Sheets API (service account) — legacy fallback:
+ *     GOOGLE_SERVICE_ACCOUNT_JSON — service-account key JSON
+ *     GOOGLE_SHEET_ID             — spreadsheet id from the sheet URL
+ *     GOOGLE_SHEET_RANGE          — optional, default "Лист1!A1"
+ *
+ * Env vars are set in the Pages project → Settings → Environment variables.
  */
 
 type Env = {
+  GOOGLE_SHEET_WEBHOOK_URL?: string;
+  LEADS_SECRET?: string;
   GOOGLE_SERVICE_ACCOUNT_JSON?: string;
   GOOGLE_SHEET_ID?: string;
   GOOGLE_SHEET_RANGE?: string;
@@ -55,7 +60,34 @@ export async function onRequestOptions(): Promise<Response> {
   });
 }
 
-/* ---------------------------- google auth ------------------------------- */
+/* ---------------------- mode A: Apps Script webhook --------------------- */
+
+async function sendToWebhook(lead: Lead, env: Env): Promise<Response> {
+  const res = await fetch(env.GOOGLE_SHEET_WEBHOOK_URL as string, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      telegram: lead.telegram,
+      vaultId: lead.vaultId ?? "",
+      slot: lead.slot ?? "",
+      userId: lead.userId ?? "",
+      firstName: lead.firstName ?? "",
+      lastName: lead.lastName ?? "",
+      languageCode: lead.languageCode ?? "",
+      startParam: lead.startParam ?? "",
+      secret: env.LEADS_SECRET ?? "",
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    console.error("Apps Script webhook error", res.status, text.slice(0, 300));
+    return json({ ok: false, error: "sheet_error" }, 502);
+  }
+  return json({ ok: true });
+}
+
+/* ------------------- mode B: Google Sheets API (legacy) ------------------ */
 
 let cachedToken: { value: string; expiresAt: number } | null = null;
 
@@ -137,6 +169,45 @@ async function getAccessToken(env: Env): Promise<string> {
   return data.access_token;
 }
 
+async function sendToSheetsApi(lead: Lead, env: Env): Promise<Response> {
+  const row = [
+    new Date().toISOString(),
+    lead.telegram,
+    lead.vaultId ?? "",
+    lead.slot ?? "",
+    lead.userId ?? "",
+    lead.firstName ?? "",
+    lead.lastName ?? "",
+    lead.languageCode ?? "",
+    lead.startParam ?? "",
+  ];
+
+  const token = await getAccessToken(env);
+  const range = env.GOOGLE_SHEET_RANGE || "Лист1!A1";
+  const url =
+    "https://sheets.googleapis.com/v4/spreadsheets/" +
+    encodeURIComponent(env.GOOGLE_SHEET_ID as string) +
+    "/values/" +
+    encodeURIComponent(range) +
+    ":append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS";
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ values: [row] }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    console.error("Sheets API error", res.status, text.slice(0, 500));
+    return json({ ok: false, error: "sheet_error" }, 502);
+  }
+  return json({ ok: true });
+}
+
 /* ------------------------------ handler --------------------------------- */
 
 export async function onRequestPost(context: { request: Request; env: Env }): Promise<Response> {
@@ -149,59 +220,26 @@ export async function onRequestPost(context: { request: Request; env: Env }): Pr
   } catch {
     return json({ ok: false, error: "invalid_json" }, 400);
   }
+  if (!lead || typeof lead !== "object") {
+    return json({ ok: false, error: "invalid_json" }, 400);
+  }
 
   const telegram =
     typeof lead.telegram === "string" ? lead.telegram.trim().replace(/^@/, "") : "";
   if (telegram.length < 4 || /\s/.test(telegram)) {
     return json({ ok: false, error: "invalid_telegram" }, 400);
   }
+  lead.telegram = telegram;
 
-  if (!env.GOOGLE_SERVICE_ACCOUNT_JSON || !env.GOOGLE_SHEET_ID) {
-    return json({ ok: false, error: "missing_env" }, 500);
-  }
-
-  // 2. Append one row to the spreadsheet.
-  // Columns (put these as headers in row 1 of the sheet):
-  //  A timestamp | B telegram | C vault_id | D slot | E user_id | F first_name
-  //  G last_name | H language | I start_param
-  const row = [
-    new Date().toISOString(),
-    telegram,
-    lead.vaultId ?? "",
-    lead.slot ?? "",
-    lead.userId ?? "",
-    lead.firstName ?? "",
-    lead.lastName ?? "",
-    lead.languageCode ?? "",
-    lead.startParam ?? "",
-  ];
-
+  // 2. Route to the configured backend.
   try {
-    const token = await getAccessToken(env);
-    const range = env.GOOGLE_SHEET_RANGE || "Лист1!A1";
-    const url =
-      "https://sheets.googleapis.com/v4/spreadsheets/" +
-      encodeURIComponent(env.GOOGLE_SHEET_ID) +
-      "/values/" +
-      encodeURIComponent(range) +
-      ":append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS";
-
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ values: [row] }),
-    });
-
-    if (!res.ok) {
-      const text = await res.text();
-      console.error("Sheets API error", res.status, text.slice(0, 500));
-      return json({ ok: false, error: "sheet_error" }, 502);
+    if (env.GOOGLE_SHEET_WEBHOOK_URL) {
+      return await sendToWebhook(lead, env);
     }
-
-    return json({ ok: true });
+    if (env.GOOGLE_SERVICE_ACCOUNT_JSON && env.GOOGLE_SHEET_ID) {
+      return await sendToSheetsApi(lead, env);
+    }
+    return json({ ok: false, error: "missing_env" }, 500);
   } catch (err) {
     console.error("append failed", err);
     return json({ ok: false, error: "internal" }, 500);

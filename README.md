@@ -20,9 +20,10 @@ npm run preview   # превью собранного билда
    │  POST /api/lead (JSON, same-origin — без CORS в проде)
    ▼
 Pages Function  functions/api/lead.ts
-   │  OAuth2 JWT (сервисный аккаунт Google, подпись RS256)
+   │  режим A: POST на Apps Script web app (рекомендуется)
+   │  режим B (legacy): OAuth2 JWT сервисного аккаунта → Sheets API
    ▼
-Google Sheets API  →  строка в твоей таблице
+Google Sheets  →  новая строка в твоей таблице
 ```
 
 ## Telegram Mini App
@@ -40,40 +41,42 @@ Google Sheets API  →  строка в твоей таблице
 
 ---
 
-## Настройка заявок в Google Sheets (один раз)
+## Настройка заявок в Google Sheets — способ A: Apps Script (рекомендуется)
 
-### 1. Таблица
+Не требует Google Cloud, сервисных аккаунтов и биллинга — работает на обычном Google-аккаунте. Подходит, если Cloud Console в твоей стране недоступна.
 
-1. Создай Google-таблицу, в первой строке напиши заголовки:
-   `timestamp | telegram | vault_id | slot | user_id | first_name | last_name | language | start_param`
-2. Скопируй **ID таблицы** из URL: `https://docs.google.com/spreadsheets/d/ВОТ_ЭТО_ИД/edit`
+1. Создай Google-таблицу.
+2. В ней: **Расширения → Apps Script**. Вставь код из файла `google/appsscript.gs` (или создай новый проект и скопируй).
+3. В начале скрипта задай:
+   - `SCRIPT_SECRET` — любая случайная строка (пароль между скриптом и Cloudflare);
+   - `SHEET_ID` — оставь пустым, если таблица привязана к скрипту.
+4. **Deploy → New deployment → Web app**:
+   - Execute as: **Me**
+   - Who has access: **Anyone**
+   - Deploy → скопируй URL (заканчивается на `/exec`).
+5. В Cloudflare Pages: **Settings → Environment variables → Production**:
 
-### 2. Сервисный аккаунт Google (ключ для доступа к API)
+   | Имя | Значение |
+   |---|---|
+   | `GOOGLE_SHEET_WEBHOOK_URL` | URL вида `https://script.google.com/macros/s/.../exec` |
+   | `LEADS_SECRET` | та же строка, что и `SCRIPT_SECRET` в скрипте |
 
-1. Открой [Google Cloud Console](https://console.cloud.google.com/) → создай проект (или выбери существующий).
-2. **APIs & Services → Library** → найди **Google Sheets API** → **Enable**.
-3. **APIs & Services → Credentials → Create Credentials → Service Account** — создай аккаунт (имя любое, например `skinvaul-leads`).
-4. В списке сервисных аккаунтов нажми на созданный → вкладка **Keys → Add Key → Create New Key** → формат **JSON** → скачай файл. Это твой `GOOGLE_SERVICE_ACCOUNT_JSON`.
-5. Вернись в Google-таблицу → **Share / Доступ** → вставь **email сервисного аккаунта** (из скачанного JSON, поле `client_email`) → права **Editor / Редактор**.
+6. Передеплой (слить PR или `wrangler pages deploy dist`).
 
-### 3. Переменные окружения в Cloudflare Pages
+> При изменении скрипта не забывай перевыпускать версию: Deploy → Manage deployments → Edit → New version.
 
-Проект на Cloudflare Pages → **Settings → Environment variables → Production** → добавить:
+---
 
-| Имя | Значение |
-|---|---|
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | весь содержимое скачанного JSON-ключа (вставить целиком, как есть) |
-| `GOOGLE_SHEET_ID` | ID таблицы из шага 1 |
-| `GOOGLE_SHEET_RANGE` | *(опционально)* диапазон, по умолчанию `Лист1!A1` (если лист называется иначе — укажи свой, например `Sheet1!A1`) |
+## Настройка заявок — способ B: сервисный аккаунт (legacy)
 
-> ⚠️ `GOOGLE_SERVICE_ACCOUNT_JSON` — секрет. Хранится только в настройках Cloudflare, в код и в git не попадает.
+Используется, только если режим A недоступен/нежелателен. Требует Google Cloud Console:
 
-### 4. Передеплой
+1. Таблица: заголовки в первой строке: `timestamp | telegram | vault_id | slot | user_id | first_name | last_name | language | start_param`.
+2. [Google Cloud Console](https://console.cloud.google.com/) → включить **Google Sheets API** → **Credentials → Service Account** → создать → **Keys → Add Key → JSON**.
+3. Расшарить таблицу на `client_email` из ключа (Editor).
+4. Переменные Cloudflare: `GOOGLE_SERVICE_ACCOUNT_JSON` (весь JSON-ключ), `GOOGLE_SHEET_ID`, опц. `GOOGLE_SHEET_RANGE` (по умолчанию `Лист1!A1`).
 
-- Если Pages подключён к репозиторию (Git integration): запуши изменения на ветку, с которой собирается проект (`functions/api/lead.ts` подхватится автоматически).
-- Если деплой через CLI: `wrangler pages deploy dist --project-name=<имя-проекта>`.
-
-Готово — отправка формы теперь пишет строку в таблицу.
+---
 
 ## Локальная разработка с реальным эндпоинтом
 
@@ -100,4 +103,5 @@ src/
   components/            Header, Hero, ScannerVisual, Ticker, LeadForm,
                          Process, Footer, Atmosphere, SpecOverlay, Hud
 functions/api/lead.ts    Pages Function: приём заявки → Google Sheets
+google/appsscript.gs     Apps Script web app (режим A, рекомендуется)
 ```
