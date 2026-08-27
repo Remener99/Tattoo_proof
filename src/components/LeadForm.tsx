@@ -1,11 +1,26 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { useInView } from "@/lib/useInView";
-import { buildLeadPayload, submitLead } from "@/lib/leads";
+import { buildLeadPayload, submitLead, LeadSubmitError } from "@/lib/leads";
 import { getTelegramUser } from "@/lib/telegram";
 import { cn } from "@/utils/cn";
 import { FocusBrackets, HudLabel } from "./Hud";
 
 type Status = "idle" | "loading" | "error" | "done";
+
+const ERROR_MESSAGES: Record<string, string> = {
+  invalid_telegram: "⚠ введите корректный telegram — например @skinvault",
+  invalid_json: "⚠ ошибка формата — обновите страницу",
+  missing_env:
+    "⚠ сервер не настроен (нет GOOGLE_SHEET_WEBHOOK_URL) — проверьте env в Cloudflare",
+  bad_secret: "⚠ несовпадение секретов LEADS_SECRET / SCRIPT_SECRET",
+  sheet_error: "⚠ не удалось записать в таблицу — проверьте Apps Script деплой",
+  sheet_unreachable: "⚠ Apps Script недоступен — проверьте URL /exec",
+  internal: "⚠ внутренняя ошибка сервера — попробуйте позже",
+  empty_body: "⚠ пустой запрос — попробуйте ещё раз",
+  network: "⚠ нет сети — проверьте соединение",
+  not_found:
+    "⚠ /api/lead не найден — локально установите VITE_API_BASE или включите мок",
+};
 
 export function LeadForm() {
   const { ref, inView } = useInView(0.15);
@@ -13,7 +28,7 @@ export function LeadForm() {
   const [status, setStatus] = useState<Status>("idle");
   const [focused, setFocused] = useState(false);
   const [prefilled, setPrefilled] = useState(false);
-  const [errorText, setErrorText] = useState("⚠ введите корректный telegram — например @skinvault");
+  const [errorText, setErrorText] = useState(ERROR_MESSAGES.invalid_telegram);
 
   // Inside Telegram: prefill the form with the user's handle from the Mini App.
   useEffect(() => {
@@ -34,7 +49,7 @@ export function LeadForm() {
     e.preventDefault();
     const clean = value.trim().replace(/^@/, "");
     if (clean.length < 4 || /\s/.test(clean)) {
-      setErrorText("⚠ введите корректный telegram — например @skinvault");
+      setErrorText(ERROR_MESSAGES.invalid_telegram);
       setStatus("error");
       return;
     }
@@ -42,8 +57,21 @@ export function LeadForm() {
     try {
       await submitLead(buildLeadPayload(clean, vaultId, slot.toString()));
       setStatus("done");
-    } catch {
-      setErrorText("⚠ не удалось отправить заявку — попробуйте ещё раз");
+      // dev helper: log success
+      if (import.meta.env.DEV) {
+        console.log(`[LeadForm] lead submitted: @${clean} ${vaultId} #${slot}`);
+      }
+    } catch (err) {
+      console.error("[LeadForm] submit failed", err);
+      if (err instanceof LeadSubmitError) {
+        setErrorText(ERROR_MESSAGES[err.code] ?? `⚠ ${err.message} — попробуйте ещё раз`);
+      } else if (err instanceof Error) {
+        const msg = err.message;
+        // Map raw HTTP messages to friendly if known
+        setErrorText(ERROR_MESSAGES[msg] ?? `⚠ не удалось отправить заявку (${msg}) — попробуйте ещё раз`);
+      } else {
+        setErrorText("⚠ не удалось отправить заявку — попробуйте ещё раз");
+      }
       setStatus("error");
     }
   };
@@ -98,7 +126,9 @@ export function LeadForm() {
                       style={{
                         background: focused
                           ? "linear-gradient(96deg,#CC0000,#7B2FBE 55%,#0066FF)"
-                          : "rgba(245,245,245,0.12)",
+                          : status === "error"
+                            ? "rgba(204,0,0,0.6)"
+                            : "rgba(245,245,245,0.12)",
                         boxShadow: focused ? "0 0 34px -6px rgba(123,47,190,0.85)" : "none",
                       }}
                     >
@@ -106,7 +136,7 @@ export function LeadForm() {
                         <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden>
                           <path
                             d="M14.6 2.3 1.9 7.2c-.7.3-.7.8 0 1l3.2 1 1.2 3.7c.2.5.4.6.8.2l1.9-1.7 3.4 2.5c.6.3 1 .1 1.2-.6l2.2-10c.2-.8-.3-1.2-1.2-1z"
-                            fill={focused ? "#9d5df0" : "#6c6c6c"}
+                            fill={focused ? "#9d5df0" : status === "error" ? "#CC0000" : "#6c6c6c"}
                           />
                         </svg>
                         <input
@@ -165,6 +195,13 @@ export function LeadForm() {
                       </span>
                     )}
                   </div>
+
+                  {import.meta.env.DEV && !import.meta.env.VITE_API_BASE && (
+                    <div className="mt-3 font-mono text-[9px] tracking-[0.12em] text-ash/50 uppercase">
+                      DEV: мок /api/lead активен — заявки логируются в консоль, не в Google Sheets.
+                      Установите VITE_API_BASE=https://ваш-проект.pages.dev для теста реального бэкенда.
+                    </div>
+                  )}
                 </form>
               </div>
             ) : (

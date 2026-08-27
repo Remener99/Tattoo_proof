@@ -63,27 +63,63 @@ export async function onRequestOptions(): Promise<Response> {
 /* ---------------------- mode A: Apps Script webhook --------------------- */
 
 async function sendToWebhook(lead: Lead, env: Env): Promise<Response> {
-  const res = await fetch(env.GOOGLE_SHEET_WEBHOOK_URL as string, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      telegram: lead.telegram,
-      vaultId: lead.vaultId ?? "",
-      slot: lead.slot ?? "",
-      userId: lead.userId ?? "",
-      firstName: lead.firstName ?? "",
-      lastName: lead.lastName ?? "",
-      languageCode: lead.languageCode ?? "",
-      startParam: lead.startParam ?? "",
-      secret: env.LEADS_SECRET ?? "",
-    }),
-  });
+  const payload = {
+    telegram: lead.telegram,
+    vaultId: lead.vaultId ?? "",
+    slot: lead.slot ?? "",
+    userId: lead.userId ?? "",
+    firstName: lead.firstName ?? "",
+    lastName: lead.lastName ?? "",
+    languageCode: lead.languageCode ?? "",
+    startParam: lead.startParam ?? "",
+    secret: env.LEADS_SECRET ?? "",
+  };
+
+  let res: Response;
+  try {
+    res = await fetch(env.GOOGLE_SHEET_WEBHOOK_URL as string, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      redirect: "follow",
+    });
+  } catch (err) {
+    console.error("Apps Script fetch failed", err);
+    return json({ ok: false, error: "sheet_unreachable" }, 502);
+  }
+
+  const text = await res.text();
+
+  // Apps Script ContentService always returns 200, even for logical errors.
+  // We must parse JSON body to detect ok:false.
+  let data: any = null;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    // If not JSON, it's likely an HTML error page (deployment not public, etc.)
+    console.error("Apps Script non-JSON response", res.status, text.slice(0, 500));
+    return json({ ok: false, error: "sheet_error", details: text.slice(0, 200) }, 502);
+  }
 
   if (!res.ok) {
-    const text = await res.text();
-    console.error("Apps Script webhook error", res.status, text.slice(0, 300));
+    console.error("Apps Script webhook HTTP error", res.status, text.slice(0, 500));
+    // Try to preserve Apps Script error code if present
+    if (data && data.error) {
+      const status = data.error === "bad_secret" ? 403 : data.error === "invalid_telegram" ? 400 : 502;
+      return json({ ok: false, error: data.error }, status);
+    }
     return json({ ok: false, error: "sheet_error" }, 502);
   }
+
+  if (data && data.ok === false) {
+    console.error("Apps Script logical error", data);
+    // Map known errors to proper HTTP codes
+    const errCode = typeof data.error === "string" ? data.error : "sheet_error";
+    const status =
+      errCode === "bad_secret" ? 403 : errCode === "invalid_telegram" ? 400 : errCode === "empty_body" ? 400 : 502;
+    return json({ ok: false, error: errCode }, status);
+  }
+
   return json({ ok: true });
 }
 
@@ -234,12 +270,28 @@ export async function onRequestPost(context: { request: Request; env: Env }): Pr
   // 2. Route to the configured backend.
   try {
     if (env.GOOGLE_SHEET_WEBHOOK_URL) {
+      if (!env.LEADS_SECRET) {
+        console.warn("LEADS_SECRET is empty — webhook will likely fail bad_secret check");
+      }
       return await sendToWebhook(lead, env);
     }
     if (env.GOOGLE_SERVICE_ACCOUNT_JSON && env.GOOGLE_SHEET_ID) {
       return await sendToSheetsApi(lead, env);
     }
-    return json({ ok: false, error: "missing_env" }, 500);
+    console.error("missing_env: no GOOGLE_SHEET_WEBHOOK_URL nor service account configured", {
+      hasWebhook: Boolean(env.GOOGLE_SHEET_WEBHOOK_URL),
+      hasSecret: Boolean(env.LEADS_SECRET),
+      hasSA: Boolean(env.GOOGLE_SERVICE_ACCOUNT_JSON),
+      hasSheetId: Boolean(env.GOOGLE_SHEET_ID),
+    });
+    return json(
+      {
+        ok: false,
+        error: "missing_env",
+        hint: "Set GOOGLE_SHEET_WEBHOOK_URL and LEADS_SECRET in Cloudflare Pages env vars",
+      },
+      500,
+    );
   } catch (err) {
     console.error("append failed", err);
     return json({ ok: false, error: "internal" }, 500);

@@ -88,6 +88,49 @@ VITE_API_BASE=https://твой-проект.pages.dev npm run dev
 
 Vite будет проксировать `/api` на деплой, и форму можно тестировать против реального эндпоинта.
 
+## Диагностика: почему «Не удалось отправить заявку»
+
+На скриншоте именно эта ошибка — `LeadForm` поймал исключение из `POST /api/lead`. Самые частые причины:
+
+### 1. Локальная разработка без бэкенда
+- В dev-режиме `vite` не имеет `/api/lead` по умолчанию.
+- Если `VITE_API_BASE` не задан, запрос уходит в 404 → форма показывает ошибку.
+- **Фикс в этом репо:** добавлен dev-мок в `vite.config.ts`. Без `VITE_API_BASE` форма теперь работает локально, логируя заявки в консоль сервера.
+- Чтобы тестировать реальный бэкенд:
+  ```bash
+  VITE_API_BASE=https://твой-проект.pages.dev npm run dev
+  ```
+
+### 2. Cloudflare Pages — не заданы env vars
+Pages Function `functions/api/lead.ts` требует:
+- `GOOGLE_SHEET_WEBHOOK_URL` = `https://script.google.com/macros/s/.../exec`
+- `LEADS_SECRET` = тот же `SCRIPT_SECRET` что в Apps Script
+- Если их нет → возвращает `missing_env` (500) → на фронте «не удалось отправить».
+
+Проверь в Cloudflare: **Pages → твой проект → Settings → Environment variables → Production**, затем redeploy.
+
+### 3. Apps Script деплой
+- В Apps Script должно быть **Deploy → Web app → Who has access: Anyone** (не «Only myself»).
+- После изменения кода: **Deploy → Manage deployments → Edit → New version → Deploy**.
+- `SCRIPT_SECRET` в `google/appsscript.gs` не должен оставаться `change-me` — замени и синхронизируй с `LEADS_SECRET`.
+- Проверка: открой `/exec` URL в браузере — должен ответить `SKINVAULT lead receiver is up...`.
+- Если возвращает HTML страницу логина Google — доступ не «Anyone».
+
+### 4. Секреты не совпадают
+- Если `LEADS_SECRET != SCRIPT_SECRET` → Apps Script отвечает `bad_secret` (403) → фронтенд маппит в `sheet_error` / `bad_secret`.
+- В логах Cloudflare Functions увидишь `Apps Script logical error { ok:false, error: 'bad_secret' }`.
+
+### 5. Таблица не привязана
+- Если скрипт не привязан к таблице и `SHEET_ID = ""`, `getActiveSpreadsheet()` вернёт null → `internal`.
+- Решение: либо открой таблицу → Расширения → Apps Script (тогда `SHEET_ID` можно оставить пустым), либо укажи ID таблицы из URL.
+
+После фикса пересобери и передеплой:
+```bash
+npm run build
+# если используешь wrangler:
+wrangler pages deploy dist
+```
+
 ## Структура
 
 ```
@@ -97,11 +140,12 @@ src/
   App.tsx                корневая композиция страницы
   index.css              тема, утилиты, анимации (Tailwind 4)
   lib/telegram.ts        обёртка Telegram WebApp SDK
-  lib/leads.ts           клиент отправки заявок
+  lib/leads.ts           клиент отправки заявок (с кодами ошибок)
   lib/useInView.ts       хук reveal-анимаций (IntersectionObserver)
   utils/cn.ts            cn() = clsx + tailwind-merge
   components/            Header, Hero, ScannerVisual, Ticker, LeadForm,
                          Process, Footer, Atmosphere, SpecOverlay, Hud
-functions/api/lead.ts    Pages Function: приём заявки → Google Sheets
+functions/api/lead.ts    Pages Function: приём заявки → Google Sheets (с детальным парсингом Apps Script ответа)
 google/appsscript.gs     Apps Script web app (режим A, рекомендуется)
+vite.config.ts           dev-мок /api/lead + прокси на VITE_API_BASE
 ```
