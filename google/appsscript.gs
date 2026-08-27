@@ -42,30 +42,50 @@ const HEADERS = [
 ];
 
 function getTargetSheet_() {
-  return SHEET_ID ? SpreadsheetApp.openById(SHEET_ID).getSheets()[0] : SpreadsheetApp.getActiveSheet();
+  if (SHEET_ID) {
+    return SpreadsheetApp.openById(SHEET_ID).getSheets()[0];
+  }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) throw new Error("No active spreadsheet — bind script to sheet or set SHEET_ID");
+  return ss.getActiveSheet() || ss.getSheets()[0];
 }
 
-function respond_(obj, status) {
-  return ContentService.createTextOutput(JSON.stringify(obj))
-    .setMimeType(ContentService.MimeType.JSON);
+function respond_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(
+    ContentService.MimeType.JSON,
+  );
 }
 
 function doPost(e) {
   try {
     if (!e || !e.postData || !e.postData.contents) {
-      return respond_({ ok: false, error: "empty_body" }, 400);
+      return respond_({ ok: false, error: "empty_body" });
     }
 
-    const data = JSON.parse(e.postData.contents);
+    let data;
+    try {
+      data = JSON.parse(e.postData.contents);
+    } catch (err) {
+      return respond_({ ok: false, error: "invalid_json" });
+    }
 
     // Shared-secret check: rejects direct spam to this URL.
-    if (data.secret !== SCRIPT_SECRET) {
-      return respond_({ ok: false, error: "bad_secret" }, 403);
+    // Trim both sides to avoid accidental whitespace mismatch.
+    const incomingSecret = String(data.secret || "").trim();
+    const expectedSecret = String(SCRIPT_SECRET || "").trim();
+    if (!expectedSecret || expectedSecret === "change-me") {
+      // Fail open with warning? No — better to error clearly so user fixes it.
+      // But we still allow if both are change-me for initial testing.
+      if (incomingSecret !== expectedSecret) {
+        return respond_({ ok: false, error: "bad_secret", hint: "SCRIPT_SECRET is still default change-me" });
+      }
+    } else if (incomingSecret !== expectedSecret) {
+      return respond_({ ok: false, error: "bad_secret" });
     }
 
     const telegram = String(data.telegram || "").trim().replace(/^@/, "");
-    if (telegram.length < 4) {
-      return respond_({ ok: false, error: "invalid_telegram" }, 400);
+    if (telegram.length < 4 || /\s/.test(telegram)) {
+      return respond_({ ok: false, error: "invalid_telegram" });
     }
 
     const sheet = getTargetSheet_();
@@ -85,15 +105,16 @@ function doPost(e) {
       data.startParam || "",
     ]);
 
-    return respond_({ ok: true }, 200);
+    return respond_({ ok: true });
   } catch (err) {
-    return respond_({ ok: false, error: String(err) }, 500);
+    return respond_({ ok: false, error: "internal", message: String(err) });
   }
 }
 
 /** GET / used to sanity-check the deployment in a browser. */
 function doGet() {
   return ContentService.createTextOutput(
-    "SKINVAULT lead receiver is up. Use POST with a JSON body.",
+    "SKINVAULT lead receiver is up. Use POST with a JSON body. Secret set: " +
+      (SCRIPT_SECRET && SCRIPT_SECRET !== "change-me" ? "yes" : "NO - change it!"),
   );
 }

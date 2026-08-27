@@ -1,0 +1,31 @@
+# Wrangler config for SKINVAULT — Cloudflare D1 version
+# Используется для локальной разработки с D1 и для деплоя через wrangler
+# Для Cloudflare Pages биндинги настраиваются также в Dashboard → Pages → Settings → Functions → D1 bindings
+
+name = "skinvault"
+type = "javascript"
+compatibility_date = "2024-08-01"
+
+# Pages Functions — директория с функциями
+[build]
+command = "npm run build"
+
+# D1 database binding
+# 1. Создай базу: wrangler d1 create skinvault_leads
+# 2. Скопируй database_id из вывода и вставь ниже
+# 3. Примени схему: wrangler d1 execute skinvault_leads --file=d1/schema.sql
+[[d1_databases]]
+binding = "LEADS_DB"
+database_name = "skinvault_leads"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+# KV (опционально, если хочешь хранить лиды ещё и в KV)
+# [[kv_namespaces]]
+# binding = "LEADS_KV"
+# id = "REPLACE_WITH_KV_ID"
+
+# Переменные окружения (секреты лучше через wrangler secret put или Dashboard)
+[vars]
+# TELEGRAM_BOT_TOKEN = ""  # лучше через Dashboard → Env vars
+# TELEGRAM_CHAT_ID = ""
+LEADS_SECRET = "change-me-to-random-string"  # для защиты /api/leads?secret=

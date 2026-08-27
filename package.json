@@ -6,7 +6,12 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "d1:create": "wrangler d1 create skinvault_leads",
+    "d1:schema": "wrangler d1 execute skinvault_leads --file=d1/schema.sql",
+    "d1:list": "wrangler d1 execute skinvault_leads --command=\"SELECT * FROM leads ORDER BY id DESC LIMIT 20;\"",
+    "d1:csv": "wrangler d1 execute skinvault_leads --command=\"SELECT * FROM leads ORDER BY id DESC;\" --json | jq -r",
+    "pages:dev": "wrangler pages dev dist --d1=LEADS_DB=skinvault_leads --compatibility-date=2024-08-01"
   },
   "dependencies": {
     "clsx": "2.1.1",
