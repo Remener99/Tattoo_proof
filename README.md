@@ -13,22 +13,25 @@ npm run build     # production-сборка в dist/ (один index.html)
 npm run preview   # превью собранного билда
 ```
 
-## Архитектура сбора заявок (без Google Sheets)
+## Архитектура сбора заявок (D1-first, без Google)
 
 ```
 Форма (LeadForm.tsx)
    │  POST /api/lead (JSON, same-origin)
    ▼
 Pages Function  functions/api/lead.ts — мульти-бэкенд, срабатывает первый успешный:
-   ├─ Telegram Bot (TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID) — RECOMMENDED
-   ├─ Generic Webhook (LEADS_WEBHOOK_URL) — Make.com / n8n / Zapier / Slack
-   ├─ Cloudflare KV (LEADS_KV binding)
-   ├─ Cloudflare D1 (LEADS_DB binding)
-   ├─ Google Sheets Apps Script (GOOGLE_SHEET_WEBHOOK_URL) — опционально
-   └─ Google Sheets API (service account) — legacy
+   ├─ Cloudflare D1 (LEADS_DB) — PRIMARY, SQLite, бесплатно, без Google
+   ├─ Cloudflare KV (LEADS_KV) — опционально
+   ├─ Telegram Bot (TELEGRAM_BOT_TOKEN + CHAT_ID) — уведомления
+   ├─ Generic Webhook (LEADS_WEBHOOK_URL) — Make.com / n8n / Zapier
+   ├─ Google Sheets Apps Script — опционально (legacy)
+   └─ Google Sheets API — legacy
    ▼
+D1 → таблица leads (авто-создание) + /api/leads?secret=XXX для просмотра
 Если ни один бэкенд не настроен → {ok:true, mock:true} — форма не ломается
 ```
+
+> Подробная инструкция по D1: см. [D1_SETUP.md](./D1_SETUP.md)
 
 ## Telegram Mini App
 
@@ -45,31 +48,40 @@ Pages Function  functions/api/lead.ts — мульти-бэкенд, сраба�
 
 ---
 
-## ✅ Рекомендуемая настройка БЕЗ Google — Telegram Bot (2 минуты)
+## ✅ Рекомендуемая настройка — Cloudflare D1 (SQLite) — 2 минуты, без Google
 
-Самая простая альтернатива Google Sheets, работает из РФ без VPN.
+**Основной способ для этого проекта.** Бесплатно, работает из РФ, без VPN и Google.
 
-1. **Создай бота:** @BotFather → `/newbot` → получи `TELEGRAM_BOT_TOKEN` вида `123456:ABC...`
-2. **Узнай свой chat_id:**
-   - Напиши боту любое сообщение
-   - Открой в браузере: `https://api.telegram.org/bot<TOKEN>/getUpdates`
-   - Найди `"chat":{"id": 123456789}` — это твой `TELEGRAM_CHAT_ID`
-   - Или используй @userinfobot для личного ID, @getidsbot для группы/канала
-3. **Cloudflare Pages:** Settings → Environment variables → Production:
-   | Имя | Значение |
-   |---|---|
+См. подробную инструкцию в [D1_SETUP.md](./D1_SETUP.md)
+
+Кратко:
+1. Dashboard → D1 → Create database `skinvault_leads` → Console → вставь `d1/schema.sql` → Execute (или пропусти — таблица создастся сама при первом лиде)
+2. Pages → твой проект → Settings → Functions → D1 bindings → Add: Variable `LEADS_DB` → выбери базу
+3. Settings → Env vars → `LEADS_SECRET` = случайная строка (для защиты `/api/leads`)
+4. Redeploy
+5. Проверка: `GET https://твой-проект.pages.dev/api/lead` → `{"configured":{"d1":true}}`
+6. Лиды: `GET /api/leads?secret=XXX` или D1 Console `SELECT * FROM leads ORDER BY id DESC`
+
+Локальная разработка с D1:
+```bash
+npm run d1:create   # wrangler d1 create
+npm run d1:schema   # применить схему
+npm run pages:dev   # запустить Pages Functions с D1 локально
+npm run d1:list     # посмотреть лиды
+```
+
+---
+
+## ✅ Альтернатива — Telegram Bot (уведомления)
+
+Можно включить вместе с D1 — тогда лиды пишутся в D1 и дублируются в Telegram.
+
+1. **Создай бота:** @BotFather → `/newbot` → получи `TELEGRAM_BOT_TOKEN`
+2. **Узнай chat_id:** напиши боту, открой `https://api.telegram.org/bot<TOKEN>/getUpdates` → `chat.id`
+3. **Cloudflare env:**
    | `TELEGRAM_BOT_TOKEN` | `123456:ABC...` |
-   | `TELEGRAM_CHAT_ID` | `123456789` или `@your_channel` |
-4. Передеплой. Готово — лиды будут приходить в Telegram:
-
-```
-🔥 SKINVAULT — новый лид
-👤 Telegram: @Remener
-🆔 Vault: SV-1234-063 | Slot: #063
-⏰ 2026-08-27T...
-```
-
-> Можно добавить бота в приватный канал/группу и указать ID канала как CHAT_ID — тогда вся команда видит лиды.
+   | `TELEGRAM_CHAT_ID` | `123456789` |
+4. Передеплой — лиды будут приходить в Telegram + в D1
 
 ---
 
@@ -98,18 +110,11 @@ Payload:
 
 1. Cloudflare Dashboard → Workers & Pages → KV → Create namespace `LEADS`
 2. Pages → твой проект → Settings → Functions → KV namespace bindings → Add: Variable `LEADS_KV` → выбери namespace
-3. Передеплой. Лиды хранятся в KV, посмотреть можно в Dashboard → KV → Browse или через `GET /api/leads` (если реализуешь)
+3. Передеплой. Лиды хранятся в KV, посмотреть через `GET /api/leads?secret=XXX`
 
-### C) Cloudflare D1 (SQLite, бесплатно)
+### C) Можно комбинировать
 
-1. Dashboard → D1 → Create database `skinvault_leads`
-2. Pages → Settings → Functions → D1 bindings → Variable `LEADS_DB` → выбери базу
-3. Код сам создаёт таблицу `leads` при первом запросе (`CREATE TABLE IF NOT EXISTS`)
-4. Лиды можно смотреть через D1 Console: `SELECT * FROM leads ORDER BY id DESC`
-
-### D) Можно комбинировать
-
-Можно включить сразу несколько: Telegram + KV + Webhook. `functions/api/lead.ts` попробует все и вернёт `ok:true` если хотя бы один сработал.
+Можно включить сразу несколько: D1 + Telegram + KV + Webhook. `functions/api/lead.ts` попробует все и вернёт `ok:true` если хотя бы один сработал. Рекомендуем D1 + Telegram для уведомлений.
 
 ---
 
