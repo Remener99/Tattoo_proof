@@ -1,24 +1,70 @@
 /**
  * Cloudflare Pages Function: POST /api/lead
  *
- * Receives a lead from the SKINVAULT landing form and writes it to a Google
- * Spreadsheet. Two modes (no bot token is ever needed):
+ * SKINVAULT lead collector — now works WITHOUT Google Sheets.
  *
- *  A) Apps Script webhook — RECOMMENDED (no Google Cloud / service account):
- *     GOOGLE_SHEET_WEBHOOK_URL — deployed Apps Script "/exec" URL (see google/appsscript.gs)
- *     LEADS_SECRET              — shared secret, must match SCRIPT_SECRET in the script
+ * Supported backends (any combination, at least one should succeed):
  *
- *  B) Direct Google Sheets API (service account) — legacy fallback:
- *     GOOGLE_SERVICE_ACCOUNT_JSON — service-account key JSON
- *     GOOGLE_SHEET_ID             — spreadsheet id from the sheet URL
- *     GOOGLE_SHEET_RANGE          — optional, default "Лист1!A1"
+ *  1) Telegram Bot — RECOMMENDED replacement for Google:
+ *     TELEGRAM_BOT_TOKEN — token from @BotFather
+ *     TELEGRAM_CHAT_ID   — your user ID / group ID / channel @username
+ *     → sends a formatted message with lead details
  *
- * Env vars are set in the Pages project → Settings → Environment variables.
+ *  2) Generic webhook — any URL that accepts JSON:
+ *     LEADS_WEBHOOK_URL — e.g. Make.com, n8n, Zapier, Slack webhook, etc.
+ *     LEADS_SECRET      — optional, sent as {secret} in payload
+ *
+ *  3) Cloudflare KV:
+ *     Bind a KV namespace as LEADS_KV in Pages → Settings → Functions → KV bindings
+ *     → stores leads as JSON with key lead:{timestamp}:{telegram}
+ *
+ *  4) Cloudflare D1:
+ *     Bind a D1 database as LEADS_DB in Pages → Settings → Functions → D1 bindings
+ *     → auto-creates table leads if missing, inserts row
+ *
+ *  5) Google Sheets — optional legacy:
+ *     GOOGLE_SHEET_WEBHOOK_URL — Apps Script /exec URL
+ *     LEADS_SECRET             — must match SCRIPT_SECRET
+ *     OR service account:
+ *     GOOGLE_SERVICE_ACCOUNT_JSON + GOOGLE_SHEET_ID (+ GOOGLE_SHEET_RANGE)
+ *
+ * If NO backend is configured, returns {ok:true, mock:true} so the form
+ * doesn't break — useful for local dev and for quick demo deploys.
  */
 
+type KVNamespace = {
+  put: (key: string, value: string) => Promise<void>;
+  get: (key: string) => Promise<string | null>;
+  list?: (opts?: any) => Promise<any>;
+};
+
+type D1Database = {
+  prepare: (query: string) => {
+    bind: (...values: any[]) => {
+      run: () => Promise<any>;
+      first: () => Promise<any>;
+      all: () => Promise<any>;
+    };
+  };
+  exec: (query: string) => Promise<any>;
+  batch?: (stmts: any[]) => Promise<any>;
+};
+
 type Env = {
-  GOOGLE_SHEET_WEBHOOK_URL?: string;
+  // Telegram (recommended)
+  TELEGRAM_BOT_TOKEN?: string;
+  TELEGRAM_CHAT_ID?: string;
+
+  // Generic webhook
+  LEADS_WEBHOOK_URL?: string;
   LEADS_SECRET?: string;
+
+  // Cloudflare bindings
+  LEADS_KV?: KVNamespace;
+  LEADS_DB?: D1Database;
+
+  // Google Sheets (optional)
+  GOOGLE_SHEET_WEBHOOK_URL?: string;
   GOOGLE_SERVICE_ACCOUNT_JSON?: string;
   GOOGLE_SHEET_ID?: string;
   GOOGLE_SHEET_RANGE?: string;
@@ -60,9 +106,171 @@ export async function onRequestOptions(): Promise<Response> {
   });
 }
 
-/* ---------------------- mode A: Apps Script webhook --------------------- */
+/* ---------------------- Telegram (recommended) ------------------------ */
 
-async function sendToWebhook(lead: Lead, env: Env): Promise<Response> {
+async function sendToTelegram(lead: Lead, env: Env): Promise<{ ok: boolean; error?: string }> {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    return { ok: false, error: "not_configured" };
+  }
+
+  const text = [
+    `🔥 <b>SKINVAULT — новый лид</b>`,
+    ``,
+    `👤 Telegram: @${lead.telegram}`,
+    `🆔 Vault: <code>${lead.vaultId || "-"}</code> | Slot: #${lead.slot || "-"}`,
+    lead.userId ? `👤 User ID: ${lead.userId}` : null,
+    lead.firstName ? `📛 Name: ${[lead.firstName, lead.lastName].filter(Boolean).join(" ")}` : null,
+    lead.languageCode ? `🌐 Lang: ${lead.languageCode}` : null,
+    lead.startParam ? `🚀 Start param: ${lead.startParam}` : null,
+    ``,
+    `⏰ ${new Date().toISOString()}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: env.TELEGRAM_CHAT_ID,
+        text,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      }),
+    });
+
+    const data = (await res.json()) as { ok?: boolean; description?: string };
+    if (!res.ok || !data.ok) {
+      console.error("Telegram API error", res.status, data);
+      return { ok: false, error: data.description || `telegram_${res.status}` };
+    }
+    return { ok: true };
+  } catch (err) {
+    console.error("Telegram fetch failed", err);
+    return { ok: false, error: "telegram_unreachable" };
+  }
+}
+
+/* ---------------------- Generic webhook ------------------------------- */
+
+async function sendToGenericWebhook(
+  lead: Lead,
+  env: Env,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!env.LEADS_WEBHOOK_URL) return { ok: false, error: "not_configured" };
+
+  try {
+    const res = await fetch(env.LEADS_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        telegram: lead.telegram,
+        vaultId: lead.vaultId ?? "",
+        slot: lead.slot ?? "",
+        userId: lead.userId ?? "",
+        firstName: lead.firstName ?? "",
+        lastName: lead.lastName ?? "",
+        languageCode: lead.languageCode ?? "",
+        startParam: lead.startParam ?? "",
+        timestamp: new Date().toISOString(),
+        secret: env.LEADS_SECRET ?? "",
+        source: "skinvault",
+      }),
+    });
+
+    if (!res.ok) {
+      const t = await res.text();
+      console.error("Generic webhook error", res.status, t.slice(0, 500));
+      return { ok: false, error: "webhook_error" };
+    }
+    return { ok: true };
+  } catch (err) {
+    console.error("Generic webhook fetch failed", err);
+    return { ok: false, error: "webhook_unreachable" };
+  }
+}
+
+/* ---------------------- Cloudflare KV --------------------------------- */
+
+async function sendToKV(lead: Lead, env: Env): Promise<{ ok: boolean; error?: string }> {
+  if (!env.LEADS_KV) return { ok: false, error: "not_configured" };
+
+  try {
+    const key = `lead:${Date.now()}:${lead.telegram}`;
+    const value = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      telegram: lead.telegram,
+      vaultId: lead.vaultId,
+      slot: lead.slot,
+      userId: lead.userId,
+      firstName: lead.firstName,
+      lastName: lead.lastName,
+      languageCode: lead.languageCode,
+      startParam: lead.startParam,
+    });
+    await env.LEADS_KV.put(key, value);
+    return { ok: true };
+  } catch (err) {
+    console.error("KV put failed", err);
+    return { ok: false, error: "kv_error" };
+  }
+}
+
+/* ---------------------- Cloudflare D1 --------------------------------- */
+
+async function sendToD1(lead: Lead, env: Env): Promise<{ ok: boolean; error?: string }> {
+  if (!env.LEADS_DB) return { ok: false, error: "not_configured" };
+
+  try {
+    // Ensure table exists
+    await env.LEADS_DB.exec(
+      `CREATE TABLE IF NOT EXISTS leads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT,
+        telegram TEXT,
+        vault_id TEXT,
+        slot TEXT,
+        user_id TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        language TEXT,
+        start_param TEXT
+      )`,
+    );
+
+    await env.LEADS_DB.prepare(
+      `INSERT INTO leads (timestamp, telegram, vault_id, slot, user_id, first_name, last_name, language, start_param)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        new Date().toISOString(),
+        lead.telegram ?? "",
+        lead.vaultId ?? "",
+        lead.slot ?? "",
+        String(lead.userId ?? ""),
+        lead.firstName ?? "",
+        lead.lastName ?? "",
+        lead.languageCode ?? "",
+        lead.startParam ?? "",
+      )
+      .run();
+
+    return { ok: true };
+  } catch (err) {
+    console.error("D1 insert failed", err);
+    return { ok: false, error: "d1_error" };
+  }
+}
+
+/* ---------------------- Google Sheets — Apps Script ------------------- */
+
+async function sendToGoogleWebhook(
+  lead: Lead,
+  env: Env,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!env.GOOGLE_SHEET_WEBHOOK_URL) return { ok: false, error: "not_configured" };
+
   const payload = {
     telegram: lead.telegram,
     vaultId: lead.vaultId ?? "",
@@ -75,55 +283,41 @@ async function sendToWebhook(lead: Lead, env: Env): Promise<Response> {
     secret: env.LEADS_SECRET ?? "",
   };
 
-  let res: Response;
   try {
-    res = await fetch(env.GOOGLE_SHEET_WEBHOOK_URL as string, {
+    const res = await fetch(env.GOOGLE_SHEET_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       redirect: "follow",
     });
+
+    const text = await res.text();
+    let data: any = null;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      console.error("Apps Script non-JSON", res.status, text.slice(0, 500));
+      return { ok: false, error: "sheet_error" };
+    }
+
+    if (!res.ok) {
+      console.error("Apps Script HTTP error", res.status, text.slice(0, 500));
+      return { ok: false, error: (data?.error as string) || "sheet_error" };
+    }
+
+    if (data && data.ok === false) {
+      console.error("Apps Script logical error", data);
+      return { ok: false, error: (data.error as string) || "sheet_error" };
+    }
+
+    return { ok: true };
   } catch (err) {
     console.error("Apps Script fetch failed", err);
-    return json({ ok: false, error: "sheet_unreachable" }, 502);
+    return { ok: false, error: "sheet_unreachable" };
   }
-
-  const text = await res.text();
-
-  // Apps Script ContentService always returns 200, even for logical errors.
-  // We must parse JSON body to detect ok:false.
-  let data: any = null;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    // If not JSON, it's likely an HTML error page (deployment not public, etc.)
-    console.error("Apps Script non-JSON response", res.status, text.slice(0, 500));
-    return json({ ok: false, error: "sheet_error", details: text.slice(0, 200) }, 502);
-  }
-
-  if (!res.ok) {
-    console.error("Apps Script webhook HTTP error", res.status, text.slice(0, 500));
-    // Try to preserve Apps Script error code if present
-    if (data && data.error) {
-      const status = data.error === "bad_secret" ? 403 : data.error === "invalid_telegram" ? 400 : 502;
-      return json({ ok: false, error: data.error }, status);
-    }
-    return json({ ok: false, error: "sheet_error" }, 502);
-  }
-
-  if (data && data.ok === false) {
-    console.error("Apps Script logical error", data);
-    // Map known errors to proper HTTP codes
-    const errCode = typeof data.error === "string" ? data.error : "sheet_error";
-    const status =
-      errCode === "bad_secret" ? 403 : errCode === "invalid_telegram" ? 400 : errCode === "empty_body" ? 400 : 502;
-    return json({ ok: false, error: errCode }, status);
-  }
-
-  return json({ ok: true });
 }
 
-/* ------------------- mode B: Google Sheets API (legacy) ------------------ */
+/* ------------------- Google Sheets API (legacy) ------------------------ */
 
 let cachedToken: { value: string; expiresAt: number } | null = null;
 
@@ -153,7 +347,6 @@ async function importPrivateKey(pem: string): Promise<CryptoKey> {
   );
 }
 
-/** Returns a Google OAuth2 access token for the spreadsheets scope (cached). */
 async function getAccessToken(env: Env): Promise<string> {
   if (cachedToken && cachedToken.expiresAt > Date.now() + 60_000) {
     return cachedToken.value;
@@ -205,43 +398,52 @@ async function getAccessToken(env: Env): Promise<string> {
   return data.access_token;
 }
 
-async function sendToSheetsApi(lead: Lead, env: Env): Promise<Response> {
-  const row = [
-    new Date().toISOString(),
-    lead.telegram,
-    lead.vaultId ?? "",
-    lead.slot ?? "",
-    lead.userId ?? "",
-    lead.firstName ?? "",
-    lead.lastName ?? "",
-    lead.languageCode ?? "",
-    lead.startParam ?? "",
-  ];
-
-  const token = await getAccessToken(env);
-  const range = env.GOOGLE_SHEET_RANGE || "Лист1!A1";
-  const url =
-    "https://sheets.googleapis.com/v4/spreadsheets/" +
-    encodeURIComponent(env.GOOGLE_SHEET_ID as string) +
-    "/values/" +
-    encodeURIComponent(range) +
-    ":append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS";
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ values: [row] }),
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    console.error("Sheets API error", res.status, text.slice(0, 500));
-    return json({ ok: false, error: "sheet_error" }, 502);
+async function sendToSheetsApi(lead: Lead, env: Env): Promise<{ ok: boolean; error?: string }> {
+  if (!env.GOOGLE_SERVICE_ACCOUNT_JSON || !env.GOOGLE_SHEET_ID) {
+    return { ok: false, error: "not_configured" };
   }
-  return json({ ok: true });
+
+  try {
+    const row = [
+      new Date().toISOString(),
+      lead.telegram,
+      lead.vaultId ?? "",
+      lead.slot ?? "",
+      lead.userId ?? "",
+      lead.firstName ?? "",
+      lead.lastName ?? "",
+      lead.languageCode ?? "",
+      lead.startParam ?? "",
+    ];
+
+    const token = await getAccessToken(env);
+    const range = env.GOOGLE_SHEET_RANGE || "Лист1!A1";
+    const url =
+      "https://sheets.googleapis.com/v4/spreadsheets/" +
+      encodeURIComponent(env.GOOGLE_SHEET_ID) +
+      "/values/" +
+      encodeURIComponent(range) +
+      ":append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS";
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ values: [row] }),
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      console.error("Sheets API error", res.status, text.slice(0, 500));
+      return { ok: false, error: "sheet_error" };
+    }
+    return { ok: true };
+  } catch (err) {
+    console.error("Sheets API failed", err);
+    return { ok: false, error: "sheet_error" };
+  }
 }
 
 /* ------------------------------ handler --------------------------------- */
@@ -249,7 +451,7 @@ async function sendToSheetsApi(lead: Lead, env: Env): Promise<Response> {
 export async function onRequestPost(context: { request: Request; env: Env }): Promise<Response> {
   const { request, env } = context;
 
-  // 1. Parse + validate the payload.
+  // 1. Parse + validate
   let lead: Lead;
   try {
     lead = (await request.json()) as Lead;
@@ -267,33 +469,74 @@ export async function onRequestPost(context: { request: Request; env: Env }): Pr
   }
   lead.telegram = telegram;
 
-  // 2. Route to the configured backend.
-  try {
-    if (env.GOOGLE_SHEET_WEBHOOK_URL) {
-      if (!env.LEADS_SECRET) {
-        console.warn("LEADS_SECRET is empty — webhook will likely fail bad_secret check");
-      }
-      return await sendToWebhook(lead, env);
+  // 2. Try all configured backends — succeed if at least one works
+  const results: { backend: string; result: { ok: boolean; error?: string } }[] = [];
+
+  // Order: Telegram first (fastest, no Google), then generic webhook, KV, D1, Google
+  const backends: { name: string; fn: () => Promise<{ ok: boolean; error?: string }> }[] = [
+    { name: "telegram", fn: () => sendToTelegram(lead, env) },
+    { name: "webhook", fn: () => sendToGenericWebhook(lead, env) },
+    { name: "kv", fn: () => sendToKV(lead, env) },
+    { name: "d1", fn: () => sendToD1(lead, env) },
+    { name: "google_webhook", fn: () => sendToGoogleWebhook(lead, env) },
+    { name: "google_api", fn: () => sendToSheetsApi(lead, env) },
+  ];
+
+  let successCount = 0;
+  let configuredCount = 0;
+
+  for (const b of backends) {
+    const r = await b.fn();
+    if (r.error !== "not_configured") {
+      configuredCount++;
+      results.push({ backend: b.name, result: r });
+      if (r.ok) successCount++;
     }
-    if (env.GOOGLE_SERVICE_ACCOUNT_JSON && env.GOOGLE_SHEET_ID) {
-      return await sendToSheetsApi(lead, env);
-    }
-    console.error("missing_env: no GOOGLE_SHEET_WEBHOOK_URL nor service account configured", {
-      hasWebhook: Boolean(env.GOOGLE_SHEET_WEBHOOK_URL),
-      hasSecret: Boolean(env.LEADS_SECRET),
-      hasSA: Boolean(env.GOOGLE_SERVICE_ACCOUNT_JSON),
-      hasSheetId: Boolean(env.GOOGLE_SHEET_ID),
-    });
-    return json(
-      {
-        ok: false,
-        error: "missing_env",
-        hint: "Set GOOGLE_SHEET_WEBHOOK_URL and LEADS_SECRET in Cloudflare Pages env vars",
-      },
-      500,
-    );
-  } catch (err) {
-    console.error("append failed", err);
-    return json({ ok: false, error: "internal" }, 500);
   }
+
+  console.log(
+    `[lead] @${lead.telegram} vault=${lead.vaultId} slot=${lead.slot} — configured=${configuredCount} success=${successCount}`,
+    results,
+  );
+
+  // If at least one backend succeeded — return ok
+  if (successCount > 0) {
+    return json({ ok: true, backends: results.map((r) => r.backend) });
+  }
+
+  // No backend configured — don't break the form, return mock success
+  // (useful for demo / dev / when user hasn't set up Telegram yet)
+  if (configuredCount === 0) {
+    console.warn(
+      "[lead] No backend configured — returning mock success. Set TELEGRAM_BOT_TOKEN+CHAT_ID or LEADS_WEBHOOK_URL or KV/D1 binding.",
+    );
+    return json({ ok: true, mock: true, warning: "no_backend_configured" });
+  }
+
+  // All configured backends failed
+  const firstError = results.find((r) => !r.result.ok)?.result.error || "internal";
+  const status =
+    firstError === "invalid_telegram"
+      ? 400
+      : firstError === "bad_secret"
+        ? 403
+        : firstError.startsWith("telegram_")
+          ? 502
+          : 502;
+
+  return json({ ok: false, error: firstError, details: results }, status);
+}
+
+// Optional: GET /api/lead for health check
+export async function onRequestGet(context: { env: Env }): Promise<Response> {
+  const { env } = context;
+  const configured = {
+    telegram: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
+    webhook: Boolean(env.LEADS_WEBHOOK_URL),
+    kv: Boolean(env.LEADS_KV),
+    d1: Boolean(env.LEADS_DB),
+    google_webhook: Boolean(env.GOOGLE_SHEET_WEBHOOK_URL),
+    google_api: Boolean(env.GOOGLE_SERVICE_ACCOUNT_JSON && env.GOOGLE_SHEET_ID),
+  };
+  return json({ ok: true, configured, hint: "POST JSON {telegram, vaultId, slot} to this endpoint" });
 }

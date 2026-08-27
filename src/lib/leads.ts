@@ -31,6 +31,12 @@ export type LeadErrorCode =
   | "bad_secret"
   | "sheet_error"
   | "sheet_unreachable"
+  | "telegram_error"
+  | "telegram_unreachable"
+  | "webhook_error"
+  | "webhook_unreachable"
+  | "kv_error"
+  | "d1_error"
   | "internal"
   | "empty_body"
   | "network"
@@ -58,12 +64,15 @@ export async function submitLead(payload: LeadPayload): Promise<void> {
   }
 
   if (res.ok) {
-    // Try to validate that body is actually {ok:true}, because Apps Script
-    // sometimes returns 200 with ok:false
+    // Validate body is actually {ok:true}
     try {
-      const data = (await res.clone().json()) as { ok?: boolean; error?: string };
+      const data = (await res.clone().json()) as { ok?: boolean; error?: string; mock?: boolean };
       if (data && data.ok === false && data.error) {
         throw new LeadSubmitError(data.error as LeadErrorCode, data.error);
+      }
+      // If mock:true — it's ok, dev or no-backend mode
+      if (data && data.mock) {
+        console.log("[leads] mock success — no backend configured, form will show success");
       }
     } catch (e) {
       if (e instanceof LeadSubmitError) throw e;
@@ -74,7 +83,6 @@ export async function submitLead(payload: LeadPayload): Promise<void> {
 
   // HTTP error path
   if (res.status === 404) {
-    // Happens in dev when /api not proxied and no mock
     throw new LeadSubmitError(
       "not_found",
       "API not found — set VITE_API_BASE or run with mock enabled",
